@@ -6,6 +6,7 @@ Pipeline (run individually or all at once):
   python build_3d_world.py 1       # COLMAP: camera pose estimation
   python build_3d_world.py 2       # 3DGRUT: train 3D Gaussian model
   python build_3d_world.py 3       # Export: USD for Isaac Sim
+  python build_3d_world.py 4       # Collision: dense mesh + attach to USDZ
   python build_3d_world.py         # run all stages
   python build_3d_world.py 2 3     # run stages 2 and 3 only
 
@@ -33,7 +34,7 @@ from pathlib import Path
 # ============================================================================
 
 # === PATHS ===
-INPUT_IMAGES_DIR = "rusko/rusko_summer"  # folder with your scene photos
+INPUT_IMAGES_DIR = "rusko/rusko_winter"  # folder with your scene photos
 OUTPUT_DIR = "rusko/output"              # all outputs go here
 THREEDGRUT_DIR = "3dgrut"                # cloned 3DGRUT repo root
 
@@ -62,7 +63,7 @@ WITH_GUI = False                                 # True to show interactive trai
 TORCH_CUDA_ARCH_LIST = "8.6"                     # RTX 3090 = 8.6, RTX 4090 = 8.9, RTX 5090 = 10.0+
 
 # === EXPORT ===
-EXPORT_FORMAT = "standard"                       # "standard" (ParticleField, recommended) or "nurec"
+EXPORT_FORMAT = "nurec"                       # "standard" (ParticleField, recommended) or "nurec"
 EXPORT_HALF_PRECISION = True                     # float16 for smaller files
 EXPORT_UP_AXIS = "z"                             # "z" for Isaac Sim (Z-up), "y" for other apps
 
@@ -173,6 +174,21 @@ def stage_1_colmap():
     log("COLMAP", f"Sparse reconstruction complete: {model_dir}")
 
 
+def find_checkpoint():
+    """Find the latest checkpoint under the training directory."""
+    candidates = sorted(glob.glob(
+        str(TRAINING_DIR / EXPERIMENT_NAME / "**" / "ckpt_last.pt"), recursive=True
+    ))
+    if candidates:
+        return Path(candidates[-1])
+    candidates = sorted(glob.glob(
+        str(TRAINING_DIR / EXPERIMENT_NAME / "**" / "ckpt_*.pt"), recursive=True
+    ))
+    if candidates:
+        return Path(candidates[-1])
+    return None
+
+
 # ============================================================================
 # STAGE 2: 3DGRUT — 3D Gaussian Training
 # ============================================================================
@@ -209,22 +225,17 @@ def stage_2_train():
         f"loss.lambda_ssim={LAMBDA_SSIM}",
         f"model.progressive_training.max_n_features={MAX_SH_DEGREE}",
         f"with_gui={WITH_GUI}",
+        "test_last=false",
         "export_usd.enabled=true",
     ]
 
     log("TRAIN", f"Starting 3DGRUT training ({N_ITERATIONS} iterations)")
     run_cmd(cmd, cwd=THREEDGRUT_DIR, stage="TRAIN")
 
-    ckpt_path = TRAINING_DIR / EXPERIMENT_NAME / "ckpt_last.pt"
-    if not ckpt_path.exists():
-        ckpt_candidates = sorted(
-            glob.glob(str(TRAINING_DIR / EXPERIMENT_NAME / "ckpt_*.pt"))
-        )
-        if ckpt_candidates:
-            ckpt_path = Path(ckpt_candidates[-1])
-        else:
-            log("TRAIN", f"No checkpoint found in {TRAINING_DIR / EXPERIMENT_NAME}")
-            sys.exit(1)
+    ckpt_path = find_checkpoint()
+    if ckpt_path is None:
+        log("TRAIN", f"No checkpoint found in {TRAINING_DIR / EXPERIMENT_NAME}")
+        sys.exit(1)
 
     log("TRAIN", f"Training complete. Checkpoint: {ckpt_path}")
 
@@ -234,16 +245,11 @@ def stage_2_train():
 # ============================================================================
 def stage_3_export():
     """Export trained model to USD for Isaac Sim."""
-    ckpt_path = TRAINING_DIR / EXPERIMENT_NAME / "ckpt_last.pt"
-    if not ckpt_path.exists():
-        ckpt_candidates = sorted(
-            glob.glob(str(TRAINING_DIR / EXPERIMENT_NAME / "ckpt_*.pt"))
-        )
-        if ckpt_candidates:
-            ckpt_path = Path(ckpt_candidates[-1])
-        else:
-            log("EXPORT", f"No checkpoint found. Run stage 2 first.")
-            sys.exit(1)
+    ckpt_path = find_checkpoint()
+    if ckpt_path is None:
+        log("EXPORT", f"No checkpoint found under {TRAINING_DIR / EXPERIMENT_NAME}. Run stage 2 first.")
+        sys.exit(1)
+    log("EXPORT", f"Using checkpoint: {ckpt_path}")
 
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     output_file = EXPORT_DIR / "scene.usdz"
@@ -274,23 +280,122 @@ def stage_3_export():
 
 
 # ============================================================================
+# STAGE 4: Collision — Mesh from sparse points + attach to USDZ
+# ============================================================================
+POISSON_DEPTH = 9                                # Poisson reconstruction depth (6-12, higher = more detail)
+POINT_CLOUD_VOXEL_SIZE = 0.02                    # voxel downsampling size (smaller = denser, 0 = no downsampling)
+
+def stage_4_collision():
+    """Generate collision mesh from COLMAP sparse points via Open3D and attach to USDZ."""
+    import struct
+    import numpy as np
+    import open3d as o3d
+
+    input_usdz = EXPORT_DIR / "scene.usdz"
+    if not input_usdz.exists():
+        log("COLLISION", "scene.usdz not found. Run stage 3 first.")
+        sys.exit(1)
+
+    points3d_bin = COLMAP_WS / "sparse" / "0" / "points3D.bin"
+    if not points3d_bin.exists():
+        log("COLLISION", "COLMAP sparse output not found. Run stage 1 first.")
+        sys.exit(1)
+
+    mesh_ply = Path(OUTPUT_DIR) / "collision_mesh.ply"
+
+    # Step 1: Read COLMAP sparse points
+    log("COLLISION", "Step 1/3: Reading COLMAP sparse point cloud")
+    points = []
+    colors = []
+    with open(points3d_bin, "rb") as f:
+        n_points = struct.unpack("<Q", f.read(8))[0]
+        for _ in range(n_points):
+            point3d_id = struct.unpack("<Q", f.read(8))[0]
+            xyz = struct.unpack("<ddd", f.read(24))
+            rgb = struct.unpack("<BBB", f.read(3))
+            error = struct.unpack("<d", f.read(8))[0]
+            n_track = struct.unpack("<Q", f.read(8))[0]
+            f.read(n_track * 8)  # skip track data
+            points.append(xyz)
+            colors.append([c / 255.0 for c in rgb])
+
+    log("COLLISION", f"Loaded {len(points)} points")
+
+    points_np = np.array(points)
+    colors_np = np.array(colors)
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points_np)
+    pcd.colors = o3d.utility.Vector3dVector(colors_np)
+
+    # Step 2: Clean up and estimate normals
+    log("COLLISION", "Step 2/3: Processing point cloud and reconstructing mesh")
+    if POINT_CLOUD_VOXEL_SIZE > 0:
+        pcd = pcd.voxel_down_sample(voxel_size=POINT_CLOUD_VOXEL_SIZE)
+        log("COLLISION", f"Downsampled to {len(pcd.points)} points")
+
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+    pcd.orient_normals_consistent_tangent_plane(k=15)
+
+    # Step 3: Poisson surface reconstruction
+    log("COLLISION", f"Running Poisson reconstruction (depth={POISSON_DEPTH})")
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=POISSON_DEPTH
+    )
+
+    # Remove low-density vertices (noisy outer shell)
+    densities_np = np.asarray(densities)
+    density_threshold = np.quantile(densities_np, 0.05)
+    vertices_to_remove = densities_np < density_threshold
+    mesh.remove_vertices_by_mask(vertices_to_remove)
+
+    log("COLLISION", f"Mesh: {len(mesh.vertices)} vertices, {len(mesh.triangles)} triangles")
+
+    # Step 4: Save mesh
+    o3d.io.write_triangle_mesh(str(mesh_ply), mesh)
+    log("COLLISION", f"Saved collision mesh: {mesh_ply}")
+
+    # Step 5: Attach to USDZ
+    tmp_usdz = EXPORT_DIR / "scene_tmp.usdz"
+
+    log("COLLISION", "Step 3/3: Attaching collision mesh to USDZ")
+    run_cmd([
+        sys.executable, "-m", "threedgrut.export.scripts.add_mesh_to_usdz",
+        "--input_usdz", str(input_usdz.resolve()),
+        "--output_usdz", str(tmp_usdz.resolve()),
+        "--mesh_ply", str(mesh_ply.resolve()),
+        "--set_collision",
+        "--set_invisible",
+        "--referencing_usd", "default.usda",
+    ], cwd=THREEDGRUT_DIR, stage="COLLISION")
+
+    if tmp_usdz.exists():
+        tmp_usdz.replace(input_usdz)
+        size_mb = input_usdz.stat().st_size / (1024 * 1024)
+        log("COLLISION", f"Done! {input_usdz} now includes collision ({size_mb:.1f} MB)")
+    else:
+        log("COLLISION", f"Failed — temp output not created")
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 STAGES = {
     "1": ("COLMAP — Camera Pose Estimation", stage_1_colmap),
     "2": ("3DGRUT — 3D Gaussian Training", stage_2_train),
     "3": ("Export — USD for Isaac Sim", stage_3_export),
+    "4": ("Collision — Dense mesh + attach to USDZ", stage_4_collision),
 }
 
 
 def main():
-    requested = sys.argv[1:] if len(sys.argv) > 1 else ["1", "2", "3"]
+    requested = sys.argv[1:] if len(sys.argv) > 1 else ["1", "2", "3", "4"]
 
     for s in requested:
         if s not in STAGES:
             print(f"Unknown stage: {s}")
-            print(f"Usage: python {sys.argv[0]} [1] [2] [3]")
-            print(f"  1 = COLMAP    2 = Train    3 = Export")
+            print(f"Usage: python {sys.argv[0]} [1] [2] [3] [4]")
+            print(f"  1 = COLMAP    2 = Train    3 = Export    4 = Collision")
             sys.exit(1)
 
     print("=" * 60)
@@ -308,7 +413,7 @@ def main():
     print(f"\n{'=' * 60}")
     print("  COMPLETE")
     print("=" * 60)
-    if "3" in requested:
+    if "4" in requested or "3" in requested:
         output_file = EXPORT_DIR / "scene.usdz"
         print(f"  Output:  {output_file}")
         print(f"  Load in Isaac Sim: File > Open > {output_file}")
