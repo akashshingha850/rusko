@@ -420,12 +420,14 @@ def stage_3_mesh():
 # ============================================================================
 
 def stage_4_texture():
-    """Generate UV atlas and bake textures from original camera images."""
+    """Generate UV atlas and bake textures from original camera images (GPU-accelerated)."""
     import numpy as np
     import cv2
     import xatlas
     import open3d as o3d
-    from scipy.spatial import KDTree
+    import torch
+    import torch.nn.functional as F
+    import time
 
     visual_path = MESH_DIR / "visual_mesh.ply"
     if not visual_path.exists():
@@ -440,14 +442,13 @@ def stage_4_texture():
         sys.exit(1)
 
     TEXTURE_DIR.mkdir(parents=True, exist_ok=True)
+    device = torch.device('cuda')
 
     # --- Load mesh ---
     log("TEX", "Loading visual mesh")
     mesh = o3d.io.read_triangle_mesh(str(visual_path))
     vertices = np.asarray(mesh.vertices, dtype=np.float64)
     triangles = np.asarray(mesh.triangles, dtype=np.uint32)
-    mesh.compute_vertex_normals()
-    vertex_normals = np.asarray(mesh.vertex_normals, dtype=np.float64)
     log("TEX", f"Mesh: {len(vertices)} verts, {len(triangles)} faces")
 
     # --- Load cameras ---
@@ -475,68 +476,79 @@ def stage_4_texture():
         log("TEX", "No valid cameras found.")
         sys.exit(1)
 
-    # --- Generate UV atlas ---
-    log("TEX", f"Generating UV atlas ({TEXTURE_ATLAS_SIZE}x{TEXTURE_ATLAS_SIZE})")
+    # --- Generate UV atlas (fast: pack at 1024, scale to target) ---
+    PACK_RES = 1024
+    uv_scale = TEXTURE_ATLAS_SIZE / PACK_RES
+    log("TEX", f"Generating UV atlas (pack at {PACK_RES}, target {TEXTURE_ATLAS_SIZE}x{TEXTURE_ATLAS_SIZE})")
+    t0 = time.time()
     atlas_obj = xatlas.Atlas()
     atlas_obj.add_mesh(
         vertices.astype(np.float32),
         triangles.astype(np.uint32),
     )
     pack_options = xatlas.PackOptions()
-    pack_options.resolution = TEXTURE_ATLAS_SIZE
-    pack_options.padding = 2
+    pack_options.resolution = PACK_RES
+    pack_options.padding = 1
     pack_options.bilinear = True
+    pack_options.blockAlign = True
     atlas_obj.generate(xatlas.ChartOptions(), pack_options)
     vmapping, uvs, new_indices = atlas_obj[0]
-    log("TEX", f"UV atlas: {len(uvs)} UV vertices, {len(new_indices)} faces")
+    uvs = uvs * uv_scale
+    log("TEX", f"UV atlas done in {time.time()-t0:.1f}s: {len(uvs)} UV verts, {len(new_indices)} faces")
 
     new_vertices_3d = vertices[vmapping]
 
-    # --- Compute per-face centers and normals ---
-    log("TEX", "Computing face properties")
-    v0 = new_vertices_3d[new_indices[:, 0]]
-    v1 = new_vertices_3d[new_indices[:, 1]]
-    v2 = new_vertices_3d[new_indices[:, 2]]
-    face_centers = (v0 + v1 + v2) / 3.0
-    edge1 = v1 - v0
-    edge2 = v2 - v0
-    face_normals = np.cross(edge1, edge2)
-    norms = np.linalg.norm(face_normals, axis=1, keepdims=True)
-    face_normals = face_normals / (norms + 1e-12)
+    # --- GPU: Compute per-face centers and normals ---
+    log("TEX", "Computing face properties (GPU)")
+    v0_t = torch.tensor(new_vertices_3d[new_indices[:, 0]], dtype=torch.float32, device=device)
+    v1_t = torch.tensor(new_vertices_3d[new_indices[:, 1]], dtype=torch.float32, device=device)
+    v2_t = torch.tensor(new_vertices_3d[new_indices[:, 2]], dtype=torch.float32, device=device)
 
-    # --- Assign best camera per face ---
-    log("TEX", "Assigning best camera to each face")
-    cam_positions = np.array([c["center"] for c in cam_list])
+    face_centers_t = (v0_t + v1_t + v2_t) / 3.0
+    face_normals_t = torch.cross(v1_t - v0_t, v2_t - v0_t, dim=1)
+    face_normals_t = F.normalize(face_normals_t, dim=1)
+
+    # --- GPU: Assign best camera per face ---
+    log("TEX", "Assigning best camera to each face (GPU)")
+    cam_positions_t = torch.tensor(
+        np.array([c["center"] for c in cam_list]), dtype=torch.float32, device=device
+    )
     num_faces = len(new_indices)
     num_cams = len(cam_list)
-    best_cam_per_face = np.zeros(num_faces, dtype=np.int32)
-
     k = min(TEXTURE_BEST_K_CAMERAS, num_cams)
-    tree = KDTree(cam_positions)
-    chunk_size = 50_000
+
+    best_cam_per_face = np.zeros(num_faces, dtype=np.int32)
+    chunk_size = 200_000
+
     for start in range(0, num_faces, chunk_size):
         end = min(start + chunk_size, num_faces)
-        chunk_centers = face_centers[start:end]
-        chunk_normals = face_normals[start:end]
-        distances, indices = tree.query(chunk_centers, k=k)
+        centers = face_centers_t[start:end]
+        normals = face_normals_t[start:end]
 
-        knn_positions = cam_positions[indices]  # (chunk, k, 3)
-        view_dirs = knn_positions - chunk_centers[:, None, :]
-        view_dists = np.linalg.norm(view_dirs, axis=2, keepdims=True)
-        view_dirs_norm = view_dirs / (view_dists + 1e-8)
+        dists = torch.cdist(centers, cam_positions_t)
+        _, topk_idx = torch.topk(dists, k, dim=1, largest=False)
 
-        cos_angles = np.sum(chunk_normals[:, None, :] * view_dirs_norm, axis=2)
-        scores = np.where(
-            cos_angles > 0.1,
-            cos_angles / (view_dists.squeeze(-1) + 1e-8),
-            -np.inf,
+        topk_pos = cam_positions_t[topk_idx]
+        view_dirs = topk_pos - centers.unsqueeze(1)
+        view_dists = torch.norm(view_dirs, dim=2, keepdim=True)
+        view_dirs_n = view_dirs / (view_dists + 1e-8)
+
+        cos_a = (normals.unsqueeze(1) * view_dirs_n).sum(dim=2)
+        scores = torch.where(
+            cos_a > 0.1,
+            cos_a / (view_dists.squeeze(-1) + 1e-8),
+            torch.tensor(-float('inf'), device=device),
         )
-        best_k = np.argmax(scores, axis=1)
-        best_cam_per_face[start:end] = indices[np.arange(len(chunk_centers)), best_k]
+        best_k = torch.argmax(scores, dim=1)
+        best_cam_per_face[start:end] = topk_idx[
+            torch.arange(end - start, device=device), best_k
+        ].cpu().numpy()
 
-        if start % 200_000 == 0 and start > 0:
+        if start % 500_000 == 0 and start > 0:
             log("TEX", f"  scored {start}/{num_faces} faces")
 
+    del v0_t, v1_t, v2_t, face_centers_t, face_normals_t, cam_positions_t
+    torch.cuda.empty_cache()
     log("TEX", "Camera assignment complete")
 
     # --- Rasterize UV triangles into face_id_map ---
@@ -549,11 +561,10 @@ def stage_4_texture():
     uv_pixel[:, 0] = np.clip(uv_pixel[:, 0], 0, atlas_w - 1)
     uv_pixel[:, 1] = np.clip(uv_pixel[:, 1], 0, atlas_h - 1)
 
-    uv_tri_pixels = uv_pixel[new_indices].astype(np.int32)  # (M, 3, 2)
+    uv_tri_pixels = uv_pixel[new_indices].astype(np.int32)
 
     for i in range(num_faces):
-        pts = uv_tri_pixels[i]  # (3, 2)
-        cv2.fillConvexPoly(face_id_map, pts, int(i))
+        cv2.fillConvexPoly(face_id_map, uv_tri_pixels[i], int(i))
         if i % 500_000 == 0 and i > 0:
             log("TEX", f"  rasterized {i}/{num_faces} faces")
 
@@ -583,9 +594,9 @@ def stage_4_texture():
     dot12 = (e1 * e2).sum(axis=1)
 
     inv_denom = 1.0 / (dot00 * dot11 - dot01 * dot01 + 1e-12)
-    bary_u = (dot11 * dot02 - dot01 * dot12) * inv_denom  # weight for vertex c
-    bary_v = (dot00 * dot12 - dot01 * dot02) * inv_denom  # weight for vertex b
-    bary_w = 1.0 - bary_u - bary_v                        # weight for vertex a
+    bary_u = (dot11 * dot02 - dot01 * dot12) * inv_denom
+    bary_v = (dot00 * dot12 - dot01 * dot02) * inv_denom
+    bary_w = 1.0 - bary_u - bary_v
 
     # --- Compute 3D positions for each texel ---
     pos_a = new_vertices_3d[new_indices[valid_face_ids, 0]]
@@ -595,13 +606,25 @@ def stage_4_texture():
 
     texel_cam_idx = best_cam_per_face[valid_face_ids]
 
-    # --- Sample textures from camera images ---
-    log("TEX", "Baking textures from camera images")
+    # --- GPU: Bake textures from camera images ---
+    log("TEX", "Baking textures from camera images (GPU)")
     atlas = np.zeros((atlas_h, atlas_w, 3), dtype=np.uint8)
 
+    R_all = torch.tensor(
+        np.stack([c["R"] for c in cam_list]), dtype=torch.float32, device=device
+    )
+    t_all = torch.tensor(
+        np.stack([c["t"] for c in cam_list]), dtype=torch.float32, device=device
+    )
+    K_all = torch.tensor(
+        np.stack([c["K"] for c in cam_list]), dtype=torch.float32, device=device
+    )
+    pos_3d_t = torch.tensor(pos_3d, dtype=torch.float32, device=device)
+    texel_cam_idx_t = torch.tensor(texel_cam_idx, dtype=torch.long, device=device)
+
     for cam_idx in range(num_cams):
-        cam_mask = texel_cam_idx == cam_idx
-        n_texels = cam_mask.sum()
+        cam_mask = texel_cam_idx_t == cam_idx
+        n_texels = cam_mask.sum().item()
         if n_texels == 0:
             continue
 
@@ -611,45 +634,45 @@ def stage_4_texture():
             continue
         img_h, img_w = img.shape[:2]
 
-        R = cam["R"]
-        t = cam["t"]
-        K = cam["K"]
+        img_t = torch.tensor(
+            img, dtype=torch.float32, device=device
+        ).permute(2, 0, 1).unsqueeze(0)
 
-        pts = pos_3d[cam_mask]
-        p_cam = pts @ R.T + t[None, :]
-        valid_depth = p_cam[:, 2] > 0.1
+        R = R_all[cam_idx]
+        t_vec = t_all[cam_idx]
+        K = K_all[cam_idx]
 
-        px = K[0, 0] * p_cam[:, 0] / (p_cam[:, 2] + 1e-8) + K[0, 2]
-        py = K[1, 1] * p_cam[:, 1] / (p_cam[:, 2] + 1e-8) + K[1, 2]
+        pts = pos_3d_t[cam_mask]
+        p_cam = pts @ R.t() + t_vec.unsqueeze(0)
 
-        in_bounds = valid_depth & (px >= 0) & (px < img_w - 1) & (py >= 0) & (py < img_h - 1)
+        z = p_cam[:, 2].clamp(min=1e-8)
+        px = K[0, 0] * p_cam[:, 0] / z + K[0, 2]
+        py = K[1, 1] * p_cam[:, 1] / z + K[1, 2]
 
-        px_valid = px[in_bounds]
-        py_valid = py[in_bounds]
+        grid_x = 2.0 * px / (img_w - 1) - 1.0
+        grid_y = 2.0 * py / (img_h - 1) - 1.0
 
-        x0 = np.floor(px_valid).astype(np.int32)
-        y0 = np.floor(py_valid).astype(np.int32)
-        x1 = x0 + 1
-        y1 = y0 + 1
-        dx = (px_valid - x0)[:, None]
-        dy = (py_valid - y0)[:, None]
+        valid = (p_cam[:, 2] > 0.1) & (grid_x.abs() <= 1) & (grid_y.abs() <= 1)
 
-        c00 = img[y0, x0].astype(np.float32)
-        c01 = img[y0, x1].astype(np.float32)
-        c10 = img[y1, x0].astype(np.float32)
-        c11 = img[y1, x1].astype(np.float32)
-        colors = (c00 * (1 - dx) * (1 - dy) + c01 * dx * (1 - dy) +
-                  c10 * (1 - dx) * dy + c11 * dx * dy)
+        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).unsqueeze(0)
+        sampled = F.grid_sample(
+            img_t, grid, mode='bilinear', align_corners=True, padding_mode='zeros'
+        )
+        colors = sampled[0, :, 0, :].t()
 
-        cam_mask_indices = np.where(cam_mask)[0]
-        valid_indices = cam_mask_indices[in_bounds]
+        cam_mask_indices = torch.where(cam_mask)[0]
+        valid_indices = cam_mask_indices[valid].cpu().numpy()
+        valid_colors = colors[valid].cpu().numpy()
 
         ay = valid_y[valid_indices]
         ax = valid_x[valid_indices]
-        atlas[ay, ax] = np.clip(colors, 0, 255).astype(np.uint8)
+        atlas[ay, ax] = np.clip(valid_colors, 0, 255).astype(np.uint8)
 
         if cam_idx % 50 == 0:
-            log("TEX", f"  camera {cam_idx}/{num_cams}: {n_texels} texels, {in_bounds.sum()} sampled")
+            log("TEX", f"  camera {cam_idx}/{num_cams}: {n_texels} texels, {valid.sum().item()} sampled")
+
+    del pos_3d_t, texel_cam_idx_t, R_all, t_all, K_all
+    torch.cuda.empty_cache()
 
     # --- Fill gaps ---
     log("TEX", "Filling atlas gaps (inpainting)")
