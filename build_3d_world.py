@@ -34,7 +34,7 @@ from pathlib import Path
 # ============================================================================
 
 # === PATHS ===
-INPUT_IMAGES_DIR = "rusko/rusko_winter"  # folder with your scene photos
+INPUT_IMAGES_DIR = "rusko/rusko_summer"  # folder with your scene photos
 OUTPUT_DIR = "rusko/output"              # all outputs go here
 THREEDGRUT_DIR = "3dgrut"                # cloned 3DGRUT repo root
 
