@@ -293,16 +293,32 @@ def stage_2_dense_mvs():
         "--PatchMatchStereo.num_iterations", str(MVS_NUM_ITERATIONS),
     ], stage="MVS")
 
+    input_type = "geometric" if MVS_GEOM_CONSISTENCY else "photometric"
+    depth_dir = DENSE_WS / "stereo" / "depth_maps"
+    normal_dir = DENSE_WS / "stereo" / "normal_maps"
+    empty_count = 0
+    for dm in depth_dir.glob(f"*.{input_type}.bin"):
+        if dm.stat().st_size == 0:
+            dm.unlink()
+            nm = normal_dir / dm.name
+            if nm.exists():
+                nm.unlink()
+            empty_count += 1
+    if empty_count:
+        log("MVS", f"Removed {empty_count} empty depth map(s) to prevent fusion crash")
+
     fused_ply = DENSE_WS / "fused.ply"
     log("MVS", "Step 3/3: Stereo fusion → dense point cloud")
     run_cmd([
         COLMAP_BIN, "stereo_fusion",
         "--workspace_path", str(DENSE_WS),
         "--workspace_format", "COLMAP",
-        "--input_type", "geometric" if MVS_GEOM_CONSISTENCY else "photometric",
+        "--input_type", input_type,
         "--output_path", str(fused_ply),
         "--StereoFusion.min_num_pixels", "3",
         "--StereoFusion.max_reproj_error", "2.0",
+        "--StereoFusion.use_cache", "1",
+        "--StereoFusion.cache_size", "16",
     ], stage="MVS")
 
     if fused_ply.exists():
@@ -431,7 +447,7 @@ def stage_4_texture():
     vertices = np.asarray(mesh.vertices, dtype=np.float64)
     triangles = np.asarray(mesh.triangles, dtype=np.uint32)
     mesh.compute_vertex_normals()
-    vertex_normals = np.asarray(mesh.normals, dtype=np.float64)
+    vertex_normals = np.asarray(mesh.vertex_normals, dtype=np.float64)
     log("TEX", f"Mesh: {len(vertices)} verts, {len(triangles)} faces")
 
     # --- Load cameras ---
@@ -466,10 +482,11 @@ def stage_4_texture():
         vertices.astype(np.float32),
         triangles.astype(np.uint32),
     )
-    atlas_obj.generate(
-        xatlas.ChartOptions(),
-        xatlas.PackOptions(resolution=TEXTURE_ATLAS_SIZE, padding=2, bilinear=True),
-    )
+    pack_options = xatlas.PackOptions()
+    pack_options.resolution = TEXTURE_ATLAS_SIZE
+    pack_options.padding = 2
+    pack_options.bilinear = True
+    atlas_obj.generate(xatlas.ChartOptions(), pack_options)
     vmapping, uvs, new_indices = atlas_obj[0]
     log("TEX", f"UV atlas: {len(uvs)} UV vertices, {len(new_indices)} faces")
 
