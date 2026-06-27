@@ -423,7 +423,6 @@ def stage_4_texture():
     """Generate UV atlas and bake textures from original camera images (GPU-accelerated)."""
     import numpy as np
     import cv2
-    import xatlas
     import open3d as o3d
     import torch
     import torch.nn.functional as F
@@ -476,25 +475,103 @@ def stage_4_texture():
         log("TEX", "No valid cameras found.")
         sys.exit(1)
 
-    # --- Generate UV atlas (fast: pack at 1024, scale to target) ---
-    PACK_RES = 1024
-    uv_scale = TEXTURE_ATLAS_SIZE / PACK_RES
-    log("TEX", f"Generating UV atlas (pack at {PACK_RES}, target {TEXTURE_ATLAS_SIZE}x{TEXTURE_ATLAS_SIZE})")
+    # --- Generate UV atlas (GPU cube-map projection, replaces xatlas) ---
+    log("TEX", f"Generating UV atlas ({TEXTURE_ATLAS_SIZE}x{TEXTURE_ATLAS_SIZE}) via cube-map projection (GPU)")
     t0 = time.time()
-    atlas_obj = xatlas.Atlas()
-    atlas_obj.add_mesh(
-        vertices.astype(np.float32),
-        triangles.astype(np.uint32),
-    )
-    pack_options = xatlas.PackOptions()
-    pack_options.resolution = PACK_RES
-    pack_options.padding = 1
-    pack_options.bilinear = True
-    pack_options.blockAlign = True
-    atlas_obj.generate(xatlas.ChartOptions(), pack_options)
-    vmapping, uvs, new_indices = atlas_obj[0]
-    uvs = uvs * uv_scale
+
+    verts_t = torch.tensor(vertices, dtype=torch.float32, device=device)
+    tris_t = torch.tensor(triangles, dtype=torch.int64, device=device)
+    num_faces = len(tris_t)
+
+    v0_t = verts_t[tris_t[:, 0]]
+    v1_t = verts_t[tris_t[:, 1]]
+    v2_t = verts_t[tris_t[:, 2]]
+    face_normals_uv = F.normalize(torch.cross(v1_t - v0_t, v2_t - v0_t, dim=1), dim=1)
+
+    directions = torch.tensor([
+        [1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [0,0,1], [0,0,-1],
+    ], dtype=torch.float32, device=device)
+    proj_axes = [(1,2), (1,2), (0,2), (0,2), (0,1), (0,1)]
+
+    face_clusters = torch.argmax(face_normals_uv @ directions.t(), dim=1)
+
+    cluster_areas = []
+    for ci in range(6):
+        mask = (face_clusters == ci)
+        if mask.sum() == 0:
+            cluster_areas.append(0.0)
+            continue
+        ax1, ax2 = proj_axes[ci]
+        ct = tris_t[mask]
+        p0 = verts_t[ct[:, 0]][:, [ax1, ax2]]
+        p1 = verts_t[ct[:, 1]][:, [ax1, ax2]]
+        p2 = verts_t[ct[:, 2]][:, [ax1, ax2]]
+        e1 = p1 - p0; e2 = p2 - p0
+        cluster_areas.append(
+            (0.5 * torch.abs(e1[:,0]*e2[:,1] - e1[:,1]*e2[:,0])).sum().item()
+        )
+
+    total_area = max(sum(cluster_areas), 1e-12)
+    padding = 4
+    atlas_sz = TEXTURE_ATLAS_SIZE
+
+    strip_heights = [max(1, int(a / total_area * atlas_sz)) for a in cluster_areas]
+    diff = atlas_sz - sum(strip_heights)
+    largest_ci = max(range(6), key=lambda i: cluster_areas[i])
+    strip_heights[largest_ci] += diff
+
+    y_offsets = []
+    cum_y = 0
+    for h in strip_heights:
+        y_offsets.append(cum_y)
+        cum_y += h
+
+    face_uvs = torch.zeros((num_faces, 3, 2), dtype=torch.float32, device=device)
+
+    for ci in range(6):
+        mask = (face_clusters == ci)
+        if mask.sum() == 0:
+            continue
+        ax1, ax2 = proj_axes[ci]
+        ct = tris_t[mask]
+        p0 = verts_t[ct[:, 0]][:, [ax1, ax2]]
+        p1 = verts_t[ct[:, 1]][:, [ax1, ax2]]
+        p2 = verts_t[ct[:, 2]][:, [ax1, ax2]]
+
+        all_pts = torch.cat([p0, p1, p2], dim=0)
+        pmin = all_pts.min(dim=0).values
+        pmax = all_pts.max(dim=0).values
+        extent = (pmax - pmin).clamp(min=1e-6)
+
+        usable_w = float(atlas_sz - 2 * padding)
+        usable_h = float(strip_heights[ci] - 2 * padding)
+        if usable_w <= 0 or usable_h <= 0:
+            continue
+
+        scale = min(usable_w / extent[0].item(), usable_h / extent[1].item())
+        final_w = extent[0].item() * scale
+        final_h = extent[1].item() * scale
+        x_off = padding + (usable_w - final_w) / 2.0
+        y_off = y_offsets[ci] + padding + (usable_h - final_h) / 2.0
+        offset = torch.tensor([x_off, y_off], dtype=torch.float32, device=device)
+
+        face_uvs[mask, 0, :] = (p0 - pmin) * scale + offset
+        face_uvs[mask, 1, :] = (p1 - pmin) * scale + offset
+        face_uvs[mask, 2, :] = (p2 - pmin) * scale + offset
+
+    vmapping = triangles.ravel().astype(np.uint32)
+    uvs = face_uvs.cpu().numpy().reshape(-1, 2).astype(np.float32)
+    new_indices = np.arange(3 * num_faces, dtype=np.uint32).reshape(num_faces, 3)
+
+    del face_uvs, face_normals_uv, v0_t, v1_t, v2_t, verts_t, tris_t
+    torch.cuda.empty_cache()
+
     log("TEX", f"UV atlas done in {time.time()-t0:.1f}s: {len(uvs)} UV verts, {len(new_indices)} faces")
+    for ci in range(6):
+        n = (face_clusters.cpu() == ci).sum().item()
+        d = ["+X","-X","+Y","-Y","+Z","-Z"][ci]
+        if n > 0:
+            log("TEX", f"  {d}: {n} faces, {strip_heights[ci]}px strip")
 
     new_vertices_3d = vertices[vmapping]
 
